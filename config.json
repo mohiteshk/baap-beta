@@ -1,0 +1,11 @@
+{
+    "video_folder": "./my_drone_videos",
+    "db_folder": "./chroma_db",
+    "lut_file": "dji.cube",
+    "music_file": "music.mp3",
+    "clip_duration": 4.0,
+    "fade_duration": 1.0,
+    "min_gap_seconds": 10.0,
+    "max_similarity_score": 0.65,
+    "num_clips_to_generate": 4
+}
