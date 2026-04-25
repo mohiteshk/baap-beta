@@ -31,8 +31,6 @@ from transformers import CLIPProcessor, CLIPModel
 import logging
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
-import numpy as np
-
 # --- LOAD CONFIGURATION ---
 CONFIG_FILE = "config.json"
 if not os.path.exists(CONFIG_FILE):
@@ -113,45 +111,6 @@ except Exception:
 
 chroma_client = chromadb.PersistentClient(path=config['db_folder'])
 collection = chroma_client.get_collection(name="drone_footage")
-
-def is_smooth_clip(video_path, start_time, duration, max_variance=15.0):
-    """
-    Checks for jerky drone motion by analyzing the variance of frame-to-frame changes.
-    Constant panning has low variance. Sudden jerks cause high variance spikes.
-    """
-    cap = cv2.VideoCapture(video_path)
-    cap.set(cv2.CAP_PROP_POS_MSEC, int(start_time * 1000))
-    
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    frames_to_check = int(duration * fps)
-    
-    # Sample ~10 frames across the clip to keep processing extremely fast
-    step = max(1, frames_to_check // 10)
-    
-    prev_frame = None
-    motion_deltas = []
-    
-    for i in range(frames_to_check):
-        ret, frame = cap.read()
-        if not ret: break
-            
-        if i % step == 0:
-            # Downscale for speed, convert to grayscale
-            gray = cv2.cvtColor(cv2.resize(frame, (320, 180)), cv2.COLOR_BGR2GRAY)
-            if prev_frame is not None:
-                # Calculate mean pixel difference between sampled frames
-                diff = np.mean(cv2.absdiff(gray, prev_frame))
-                motion_deltas.append(diff)
-            prev_frame = gray
-            
-    cap.release()
-    
-    if len(motion_deltas) < 2:
-        return True, 0.0 # Not enough data, assume it's fine
-        
-    # Calculate variance of motion
-    motion_variance = np.var(motion_deltas)
-    return motion_variance < max_variance, motion_variance
 
 def create_master_montage(prompt):
     # 1. Handle Music & Beat Sync Logic
