@@ -1,19 +1,37 @@
 {
-    "video_folders": [
-        "./my_drone_videos"
-    ],
-    "db_folder": "./chroma_db",
-    "lut_file": "dji.cube",
-    "music_folders": [
-        "./music"
-    ],
-    "sync_to_beats": true,
-    "fps_to_extract": 12,
-    "batch_size": 32,
-    "clip_duration": 4.0,
-    "fade_duration": 1.0,
-    "min_gap_seconds": 10.0,
-    "max_similarity_score": 0.65,
-    "num_clips_to_generate": 20,
-    "max_motion_variance": 5.0
+    "paths": {
+        "video_folders": ["./my_drone_videos",
+                          "/mnt/extra/Drone/Beeta/15_harohalli_betta/",
+                          "/mnt/extra/Drone/Beeta/6_Alwar-Pushkar/",
+                          "/mnt/extra/Drone/Beeta/14_goa_march26/",
+                          "/mnt/extra/Drone/Bee/2_Alwar/"],
+                          
+        "music_folders": ["./music"],
+        "db_folder": "./chroma_db",
+        "temp_render_dir": "./temp_render",
+        "lut_file": "dji.cube",
+        "log_file": "logs/drone_editor.log"
+    },
+    "system_performance": {
+        "num_workers": 4,
+        "batch_size": 16,
+        "queue_max_size": 150
+    },
+    "ai_settings": {
+        "model_id": "openai/clip-vit-base-patch32",
+        "collection_name": "drone_footage",
+        "search_top_k": 5
+    },
+    "montage_timing": {
+        "sync_to_beats": true,
+        "clip_duration": 4.0,
+        "fade_duration": 1.0,
+        "num_clips_to_generate": 20
+    },
+    "intelligence_filters": {
+        "fps_to_extract": 15,
+        "min_gap_seconds": 10.0,
+        "max_similarity_score": 0.65,
+        "max_motion_variance": 7.5
+    }
 }

@@ -1,168 +1,170 @@
+# MUST BE IMPORTED FIRST
+from core.env_setup import configure_pytorch
+
+# Now import the rest
 import os
-import json
 import cv2
+import multiprocessing as mp
 from tqdm import tqdm
-
-# --- SILENCE HUGGING FACE WARNINGS ---
-os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
-os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
-
-# --- AMD ROCm 6700 XT STABILITY FIXES ---
-os.environ["HSA_OVERRIDE_GFX_VERSION"] = "10.3.0"
-os.environ["MIOPEN_DISABLE_CACHE"] = "1"
-os.environ["PYTORCH_HIP_ALLOC_CONF"] = "garbage_collection_threshold:0.8,max_split_size_mb:512"
-
-import cv2
-cv2.setNumThreads(0) 
-
-import torch
-torch.backends.cuda.enable_flash_sdp(False)
-torch.backends.cuda.enable_mem_efficient_sdp(False)
-torch.backends.cuda.enable_math_sdp(True)
-torch.backends.cudnn.enabled = False
-
-import chromadb
 from PIL import Image
-from transformers import CLIPProcessor, CLIPModel
-import logging
-logging.getLogger("transformers").setLevel(logging.ERROR)
 
-# --- LOAD CONFIGURATION ---
-CONFIG_FILE = "config.json"
-if not os.path.exists(CONFIG_FILE):
-    raise FileNotFoundError(f"Missing {CONFIG_FILE}. Please create it first.")
+from core.config import config
+from core.model import VisionTextModel
+from core.database import get_chroma_collection
+import traceback
+from core.logger import log  # <-- Import our new logger
 
-with open(CONFIG_FILE, 'r') as f:
-    config = json.load(f)
+def video_worker(worker_id, video_queue, frame_queue):
+    cv2.setNumThreads(0) 
+    log.info(f"CPU Worker {worker_id} spun up successfully.")
+    
+    while True:
+        try:
+            task = video_queue.get()
+            if task is None:
+                log.debug(f"Worker {worker_id} received shutdown signal.")
+                frame_queue.put(None)
+                break
+                
+            video_path, existing_ids, fps_to_extract = task
+            filename = os.path.basename(video_path)
+            log.debug(f"Worker {worker_id} starting decoding: {filename}")
+            
+            cap = cv2.VideoCapture(video_path)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            
+            if fps == 0:
+                log.warning(f"Worker {worker_id}: Cannot read FPS for {filename}, skipping.")
+                cap.release()
+                frame_queue.put(("DONE", filename, None))
+                continue
 
-video_folders = config.get('video_folders', ['./my_drone_videos'])
-fps_to_extract = config.get('fps_to_extract', 1)
-BATCH_SIZE = config.get('batch_size', 32) # The Turbo Charger
-
-# --- INITIALIZATION ---
-print("Loading AI Models...")
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model_id = "openai/clip-vit-base-patch32"
-
-try:
-    processor = CLIPProcessor.from_pretrained(model_id, local_files_only=True)
-    model = CLIPModel.from_pretrained(model_id, torch_dtype=torch.float16, local_files_only=True).to(device)
-    print("✅ Model loaded instantly from local disk cache.")
-except Exception:
-    print("⚠️ Local cache not found. Downloading model...")
-    processor = CLIPProcessor.from_pretrained(model_id)
-    model = CLIPModel.from_pretrained(model_id, torch_dtype=torch.float16).to(device)
-
-print("Connecting to Knowledge Base...")
-chroma_client = chromadb.PersistentClient(path=config['db_folder'])
-collection = chroma_client.get_or_create_collection(
-    name="drone_footage",
-    metadata={"hnsw:space": "cosine"}
-)
-
-def process_batch(frames, metadatas):
-    """Feeds a massive block of frames to the AMD GPU all at once."""
+            frame_interval = max(1, int(fps / fps_to_extract) if fps_to_extract > 0 else int(fps))
+            current_frame = 0
+            
+            while cap.isOpened():
+                if current_frame % frame_interval == 0:
+                    ret, frame = cap.read()
+                    if not ret: break
+                    
+                    timestamp_sec = current_frame / fps
+                    frame_id = f"{filename}_{timestamp_sec:.2f}"
+                    
+                    if frame_id not in existing_ids:
+                        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        meta = {"filename": filename, "timestamp": timestamp_sec, "ingested_fps": fps_to_extract}
+                        
+                        # If RAM fills up, this queue.put block can freeze.
+                        frame_queue.put(("FRAME", rgb_frame, meta))
+                else:
+                    if not cap.grab(): break
+                current_frame += 1
+                
+            cap.release()
+            log.debug(f"Worker {worker_id} finished decoding: {filename}")
+            frame_queue.put(("DONE", filename, None))
+            
+        except Exception as e:
+            # THIS IS THE CRITICAL ADDITION
+            log.error(f"🚨 FATAL ERROR in Worker {worker_id} processing {filename if 'filename' in locals() else 'Unknown'}: {str(e)}")
+            log.error(traceback.format_exc())
+            # Ensure the queue doesn't deadlock by sending a completion signal even on failure
+            frame_queue.put(("DONE", filename if 'filename' in locals() else "ERROR", None))
+            
+def process_batch(frames, metadatas, model, collection):
     if not frames: return
-    
-    # 1. Process all images into one massive tensor block
-    inputs = processor(images=frames, return_tensors="pt").to(device, torch.float16)
-    
-    with torch.no_grad():
-        # 2. GPU crunches all 32 frames simultaneously
-        image_features = model.get_image_features(pixel_values=inputs.pixel_values)
-        
-        if not isinstance(image_features, torch.Tensor):
-            if hasattr(image_features, 'pooler_output'):
-                image_features = image_features.pooler_output
-            elif hasattr(image_features, 'image_embeds'):
-                image_features = image_features.image_embeds
-            else:
-                image_features = image_features[0]
-                
-        # 3. Math and normalization
-        image_features = image_features.to(torch.float32)
-        image_features = image_features / image_features.norm(p=2, dim=-1, keepdim=True)
-        embeddings = image_features.cpu().numpy().tolist()
-    
-    # 4. Save entire batch to ChromaDB instantly
+    embeddings = model.get_image_embeddings(frames)
     ids = [f"{m['filename']}_{m['timestamp']:.2f}" for m in metadatas]
-    collection.add(
-        embeddings=embeddings,
-        metadatas=metadatas,
-        ids=ids
-    )
-
-def process_video(video_path):
-    filename = os.path.basename(video_path)
-    
-    existing_records = collection.get(where={"filename": filename}, limit=1)
-    if len(existing_records['ids']) > 0:
-        print(f"⏭️  Skipping: {filename} (Already in Knowledge Base)")
-        return
-
-    print(f"\nProcessing: {filename}")
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    if fps == 0 or total_frames == 0:
-        print(f"⚠️ Skipping {filename} - couldn't read video properties.")
-        return
-
-    frame_interval = int(fps / fps_to_extract) if fps_to_extract > 0 else int(fps)
-    if frame_interval < 1: frame_interval = 1
-    
-    current_frame = 0
-    frame_buffer = []
-    meta_buffer = []
-    
-    with tqdm(total=total_frames, desc=filename) as pbar:
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret: break
-            
-            if current_frame % frame_interval == 0:
-                timestamp_sec = current_frame / fps
-                
-                # Convert to RGB and keep it in RAM
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                pil_img = Image.fromarray(rgb_frame)
-                
-                frame_buffer.append(pil_img)
-                meta_buffer.append({"filename": filename, "timestamp": timestamp_sec})
-                
-                # If we hit 32 frames, unleash the GPU!
-                if len(frame_buffer) >= BATCH_SIZE:
-                    process_batch(frame_buffer, meta_buffer)
-                    frame_buffer.clear()
-                    meta_buffer.clear()
-                
-            current_frame += 1
-            pbar.update(1)
-            
-    # Clean up any leftover frames in the buffer at the end of the video
-    if len(frame_buffer) > 0:
-        process_batch(frame_buffer, meta_buffer)
-        
-    cap.release()
+    collection.add(embeddings=embeddings, metadatas=metadatas, ids=ids)
 
 if __name__ == "__main__":
-    valid_extensions = ('.mp4', '.mov', '.avi', '.mkv')
-    videos_found = 0
+    mp.set_start_method('spawn', force=True)
+    device = configure_pytorch()
     
-    for folder in video_folders:
-        if not os.path.exists(folder):
-            print(f"⚠️ Folder not found: {folder}")
-            continue
-            
-        print(f"\n📂 Scanning folder: {folder}")
-        video_files = [f for f in os.listdir(folder) if f.lower().endswith(valid_extensions)]
+    # Initialize Core Resources
+    model = VisionTextModel(device)
+    collection = get_chroma_collection()
+
+    fps_to_extract = config.get('fps_to_extract', 1)
+    batch_size = config.get('batch_size', 32)
+    num_workers = config.get('num_workers', 4) 
+    
+    tasks_to_run = []
+    print("\n📂 Scanning folders and validating video properties...")
+    for folder in config['video_folders']:
+        if not os.path.exists(folder): continue
+        for vf in os.listdir(folder):
+            if vf.lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
+                video_path = os.path.join(folder, vf)
+                filename = os.path.basename(video_path)
+                
+                cap = cv2.VideoCapture(video_path)
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                cap.release()
+                if fps == 0: continue
+                
+                rounded_fps = int(round(fps))
+                if fps_to_extract > rounded_fps or rounded_fps % fps_to_extract != 0:
+                    valid_factors = [str(i) for i in range(1, rounded_fps + 1) if rounded_fps % i == 0]
+                    print(f"⚠️ Skipping {filename}: Requested {fps_to_extract} FPS is not a valid factor of ~{rounded_fps} FPS. (Valid: {', '.join(valid_factors)})")
+                    continue
+
+                existing_records = collection.get(where={"filename": filename}, include=["metadatas"])
+                existing_ids = set(existing_records['ids'])
+                
+                if existing_ids:
+                    ingested_fps = max([m.get("ingested_fps", 0) for m in existing_records['metadatas']])
+                    if fps_to_extract <= ingested_fps:
+                        print(f"⏭️  Already Synced: {filename} ({ingested_fps} fps)")
+                        continue
+                    else:
+                        print(f"🔄 Queued for Upgrade: {filename} ({ingested_fps} fps -> {fps_to_extract} fps)")
+                else:
+                    print(f"📥 Queued for Ingestion: {filename}")
+                
+                tasks_to_run.append((video_path, existing_ids, fps_to_extract))
+
+    if not tasks_to_run:
+        print("\n✅ Knowledge Base is fully up to date. Nothing to do!")
+        exit()
+    
+    # Fetch max_size from config to prevent RAM overflow
+    queue_limit = config.get('queue_max_size', 100)
+    
+    video_queue = mp.Queue()
+    frame_queue = mp.Queue(maxsize=queue_limit)
+    for task in tasks_to_run: video_queue.put(task)
+    for _ in range(num_workers): video_queue.put(None)
         
-        for vf in video_files:
-            videos_found += 1
-            process_video(os.path.join(folder, vf))
-            
-    if videos_found == 0:
-        print("\nNo videos found in any of your configured folders!")
-    else:
-        print("\n✅ Knowledge Base Sync Complete!")
+    workers = [mp.Process(target=video_worker, args=(i, video_queue, frame_queue)) for i in range(num_workers)]
+    for w in workers: w.start()
+
+    print(f"\n🚀 Launching {num_workers} CPU Cores to feed the GPU...")
+    frame_buffer, meta_buffer = [], []
+    active_workers = num_workers
+    
+    with tqdm(total=len(tasks_to_run), desc="Videos Processed") as pbar:
+        while active_workers > 0:
+            item = frame_queue.get()
+            if item is None:
+                active_workers -= 1
+                continue
+                
+            msg_type, data1, data2 = item
+            if msg_type == "FRAME":
+                frame_buffer.append(Image.fromarray(data1))
+                meta_buffer.append(data2)
+                
+                if len(frame_buffer) >= batch_size:
+                    process_batch(frame_buffer, meta_buffer, model, collection)
+                    frame_buffer.clear()
+                    meta_buffer.clear()
+                    
+            elif msg_type == "DONE":
+                pbar.update(1)
+
+    if frame_buffer:
+        process_batch(frame_buffer, meta_buffer, model, collection)
+
+    for p in workers: p.join()
+    print("\n✅ High-Speed Knowledge Base Sync Complete!")
