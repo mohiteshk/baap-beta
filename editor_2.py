@@ -3,16 +3,22 @@ import json
 import subprocess
 import shutil
 import cv2
+import random
 from skimage.metrics import structural_similarity as ssim
 
 # --- SILENCE HUGGING FACE WARNINGS ---
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+os.environ["HF_HUB_OFFLINE"] = "1"
 
 # --- AMD ROCm 6700 XT STABILITY FIXES ---
 os.environ["HSA_OVERRIDE_GFX_VERSION"] = "10.3.0"
 os.environ["MIOPEN_DISABLE_CACHE"] = "1"
 os.environ["PYTORCH_HIP_ALLOC_CONF"] = "garbage_collection_threshold:0.8,max_split_size_mb:512"
+
+# hipBLASLt is an optimized linear algebra backend for enterprise cards. 
+# 6700xt architecture doesn't support it, so it falls back to standard hipblas
+warnings.filterwarnings("ignore", message=".*Attempting to use hipBLASLt.*")
 
 import torch
 torch.backends.cuda.enable_flash_sdp(False)
@@ -25,6 +31,8 @@ from transformers import CLIPProcessor, CLIPModel
 import logging
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
+import numpy as np
+
 # --- LOAD CONFIGURATION ---
 CONFIG_FILE = "config.json"
 if not os.path.exists(CONFIG_FILE):
@@ -33,33 +41,58 @@ if not os.path.exists(CONFIG_FILE):
 with open(CONFIG_FILE, 'r') as f:
     config = json.load(f)
 
-# --- HELPER: FRAME EXTRACTOR FOR SSIM ---
+# Fallback for old configs
+video_folders = config.get('video_folders', [config.get('video_folder', './my_drone_videos')])
+music_folders = config.get('music_folders', [])
+
+# --- HELPER FUNCTIONS ---
+def find_video_path(filename):
+    """Scours all provided video folders to find where the video actually lives."""
+    for folder in video_folders:
+        path = os.path.join(folder, filename)
+        if os.path.exists(path):
+            return path
+    return None
+
+def get_random_music():
+    """Finds all audio files across all music folders and picks one randomly."""
+    valid_exts = ('.mp3', '.wav', '.m4a')
+    all_music = []
+    for folder in music_folders:
+        if os.path.exists(folder):
+            for f in os.listdir(folder):
+                if f.lower().endswith(valid_exts):
+                    all_music.append(os.path.join(folder, f))
+    
+    if all_music:
+        chosen = random.choice(all_music)
+        print(f"🎵 Randomly selected track: {os.path.basename(chosen)}")
+        return chosen
+    return None
+
 def get_frame_at_time(video_path, time_sec):
     cap = cv2.VideoCapture(video_path)
-    # Fast forward to exact millisecond
     cap.set(cv2.CAP_PROP_POS_MSEC, int(time_sec * 1000))
     ret, frame = cap.read()
     cap.release()
     if ret:
-        # Resize to 320x180 for blazing fast SSIM math, and convert to Grayscale
         frame = cv2.resize(frame, (320, 180))
         return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     return None
 
-def check_jump_cut(clip1_meta, clip2_meta, config):
-    """Returns True if the transition between these two clips is too visually similar."""
-    # We compare the END of Clip 1 with the START of Clip 2
-    end_time_1 = clip1_meta['timestamp'] + config['clip_duration']
+def check_jump_cut(clip1_meta, clip2_meta, clip_dur):
+    end_time_1 = clip1_meta['timestamp'] + clip_dur
     start_time_2 = clip2_meta['timestamp']
     
-    path1 = os.path.join(config['video_folder'], clip1_meta['filename'])
-    path2 = os.path.join(config['video_folder'], clip2_meta['filename'])
+    path1 = find_video_path(clip1_meta['filename'])
+    path2 = find_video_path(clip2_meta['filename'])
+    
+    if not path1 or not path2: return False
     
     frame1 = get_frame_at_time(path1, end_time_1)
     frame2 = get_frame_at_time(path2, start_time_2)
     
-    if frame1 is None or frame2 is None:
-        return False # Fallback if read fails
+    if frame1 is None or frame2 is None: return False
         
     score, _ = ssim(frame1, frame2, full=True)
     return score > config['max_similarity_score']
@@ -69,7 +102,6 @@ print("Loading AI Models...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model_id = "openai/clip-vit-base-patch32"
 
-# Safe loading: Force local cache. If it fails, download once.
 try:
     processor = CLIPProcessor.from_pretrained(model_id, local_files_only=True)
     model = CLIPModel.from_pretrained(model_id, torch_dtype=torch.float16, local_files_only=True).to(device)
@@ -82,7 +114,75 @@ except Exception:
 chroma_client = chromadb.PersistentClient(path=config['db_folder'])
 collection = chroma_client.get_collection(name="drone_footage")
 
+def is_smooth_clip(video_path, start_time, duration, max_variance=15.0):
+    """
+    Checks for jerky drone motion by analyzing the variance of frame-to-frame changes.
+    Constant panning has low variance. Sudden jerks cause high variance spikes.
+    """
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_MSEC, int(start_time * 1000))
+    
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    frames_to_check = int(duration * fps)
+    
+    # Sample ~10 frames across the clip to keep processing extremely fast
+    step = max(1, frames_to_check // 10)
+    
+    prev_frame = None
+    motion_deltas = []
+    
+    for i in range(frames_to_check):
+        ret, frame = cap.read()
+        if not ret: break
+            
+        if i % step == 0:
+            # Downscale for speed, convert to grayscale
+            gray = cv2.cvtColor(cv2.resize(frame, (320, 180)), cv2.COLOR_BGR2GRAY)
+            if prev_frame is not None:
+                # Calculate mean pixel difference between sampled frames
+                diff = np.mean(cv2.absdiff(gray, prev_frame))
+                motion_deltas.append(diff)
+            prev_frame = gray
+            
+    cap.release()
+    
+    if len(motion_deltas) < 2:
+        return True, 0.0 # Not enough data, assume it's fine
+        
+    # Calculate variance of motion
+    motion_variance = np.var(motion_deltas)
+    return motion_variance < max_variance, motion_variance
+
 def create_master_montage(prompt):
+    # 1. Handle Music & Beat Sync Logic
+    chosen_music = get_random_music()
+    dynamic_clip_dur = config['clip_duration']
+    dynamic_fade_dur = config['fade_duration']
+
+    if config.get('sync_to_beats') and chosen_music:
+        try:
+            import librosa
+            import numpy as np
+            print("🎧 Analyzing music tempo for beat synchronization...")
+            # Load just the first 30 seconds to calculate BPM instantly
+            y, sr = librosa.load(chosen_music, duration=30)
+            tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+            bpm = tempo[0] if isinstance(tempo, np.ndarray) else tempo
+            
+            if bpm > 0:
+                beat_length = 60.0 / bpm
+                # Find how many beats fit closest to the user's desired clip duration
+                beats_per_clip = max(1, round(dynamic_clip_dur / beat_length))
+                
+                # Math: Force clip to exactly match the phrasing, and fade to exactly 1 beat
+                dynamic_clip_dur = beats_per_clip * beat_length
+                dynamic_fade_dur = beat_length
+                
+                print(f"   -> Detected {bpm:.1f} BPM. Snapping clips to {dynamic_clip_dur:.2f}s (exactly {beats_per_clip} beats).")
+        except Exception as e:
+            print(f"⚠️ Could not analyze beats, using default duration. (Error: {e})")
+
+    # 2. Semantic Search
     print(f"\n🎬 Searching Knowledge Base for: '{prompt}'...")
     inputs = processor(text=[prompt], return_tensors="pt", padding=True).to(device)
     
@@ -94,7 +194,6 @@ def create_master_montage(prompt):
         text_features = text_features / text_features.norm(p=2, dim=-1, keepdim=True)
         embedding = text_features.cpu().numpy().flatten().tolist()
     
-    # Fetch top 30 to give our heavy filters room to breathe
     results = collection.query(query_embeddings=[embedding], n_results=30)
     
     selected_clips = []
@@ -103,23 +202,23 @@ def create_master_montage(prompt):
     for i in range(len(results['ids'][0])):
         meta = results['metadatas'][0][i]
         
-        # 1. Temporal Filter: Reject if too close to an already selected clip from the same video
+        # Verify file actually exists in one of the folders
+        if not find_video_path(meta['filename']):
+            continue
+
         is_too_close = False
         for sc in selected_clips:
             if sc['filename'] == meta['filename'] and abs(sc['timestamp'] - meta['timestamp']) < config['min_gap_seconds']:
                 is_too_close = True
                 break
-        if is_too_close:
-            continue
+        if is_too_close: continue
             
-        # 2. Structural Filter (SSIM): Reject jump cuts with the immediately preceding clip
         if len(selected_clips) > 0:
             last_clip = selected_clips[-1]
-            if check_jump_cut(last_clip, meta, config):
+            if check_jump_cut(last_clip, meta, dynamic_clip_dur):
                 print(f"   - Rejected {meta['filename']} at {int(meta['timestamp'])}s (Failed SSIM: Jump Cut detected)")
                 continue
                 
-        # If it passes both filters, it makes the cut!
         selected_clips.append(meta)
         print(f"   + Selected: {meta['filename']} at {int(meta['timestamp'])}s")
             
@@ -128,19 +227,18 @@ def create_master_montage(prompt):
 
     num_clips = len(selected_clips)
     if num_clips < 2:
-        print("⚠️ Could not find enough diverse clips. Try a simpler prompt or lower the max_similarity_score in config.")
+        print("⚠️ Could not find enough diverse clips. Try a simpler prompt.")
         return
 
     temp_dir = "./temp_render"
-    if os.path.exists(temp_dir):
-        shutil.rmtree(temp_dir)
+    if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
     os.makedirs(temp_dir)
     
     print("\n✂️ Extracting clips, forcing 1080p/30fps, and applying LUT...")
     for i in range(num_clips):
         meta = selected_clips[i]
-        start_time = max(0, meta['timestamp'] - 1.5)
-        input_path = os.path.join(config['video_folder'], meta['filename'])
+        start_time = max(0, meta['timestamp'] - (dynamic_fade_dur / 2)) # Pad start for smooth fade
+        input_path = find_video_path(meta['filename'])
         output_clip = os.path.join(temp_dir, f"clip_{i}.mp4")
         
         video_filters = f"fps=30,scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2"
@@ -150,7 +248,7 @@ def create_master_montage(prompt):
         ffmpeg_cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
             "-ss", str(start_time), "-i", input_path,
-            "-t", str(config['clip_duration']),
+            "-t", str(dynamic_clip_dur),
             "-vf", video_filters,
             "-an", 
             "-c:v", "libx264", "-preset", "fast", "-crf", "22",
@@ -160,34 +258,31 @@ def create_master_montage(prompt):
 
     print("\n🧵 Generating Filtergraph for Smooth Transitions...")
     final_output = f"{prompt.replace(' ', '_')}_cinematic.mp4"
-    fade = config['fade_duration']
-    clip_dur = config['clip_duration']
-    total_video_length = clip_dur + (num_clips - 1) * (clip_dur - fade)
+    
+    total_video_length = dynamic_clip_dur + (num_clips - 1) * (dynamic_clip_dur - dynamic_fade_dur)
     
     concat_cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
-    
     for i in range(num_clips):
         concat_cmd.extend(["-i", os.path.join(temp_dir, f"clip_{i}.mp4")])
         
-    has_music = os.path.exists(config['music_file'])
-    if has_music:
-        concat_cmd.extend(["-i", config['music_file']])
+    if chosen_music:
+        concat_cmd.extend(["-i", chosen_music])
 
     filter_chains = []
-    offset = clip_dur - fade
-    filter_chains.append(f"[0:v][1:v]xfade=transition=fade:duration={fade}:offset={offset}[v1]")
+    offset = dynamic_clip_dur - dynamic_fade_dur
+    filter_chains.append(f"[0:v][1:v]xfade=transition=fade:duration={dynamic_fade_dur}:offset={offset}[v1]")
     
     for i in range(2, num_clips):
-        offset = i * (clip_dur - fade)
-        filter_chains.append(f"[v{i-1}][{i}:v]xfade=transition=fade:duration={fade}:offset={offset}[v{i}]")
+        offset = i * (dynamic_clip_dur - dynamic_fade_dur)
+        filter_chains.append(f"[v{i-1}][{i}:v]xfade=transition=fade:duration={dynamic_fade_dur}:offset={offset}[v{i}]")
         
     video_map = f"[v{num_clips-1}]"
     filter_complex = "; ".join(filter_chains)
 
-    if has_music:
+    if chosen_music:
         audio_idx = num_clips
-        fade_out_start = total_video_length - fade
-        audio_filter = f"[{audio_idx}:a]afade=t=in:ss=0:d={fade},afade=t=out:st={fade_out_start}:d={fade}[aout]"
+        fade_out_start = total_video_length - dynamic_fade_dur
+        audio_filter = f"[{audio_idx}:a]afade=t=in:ss=0:d={dynamic_fade_dur},afade=t=out:st={fade_out_start}:d={dynamic_fade_dur}[aout]"
         filter_complex += f"; {audio_filter}"
         audio_map = "[aout]"
     else:
