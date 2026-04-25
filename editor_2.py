@@ -18,6 +18,7 @@ os.environ["PYTORCH_HIP_ALLOC_CONF"] = "garbage_collection_threshold:0.8,max_spl
 
 # hipBLASLt is an optimized linear algebra backend for enterprise cards. 
 # 6700xt architecture doesn't support it, so it falls back to standard hipblas
+import warnings
 warnings.filterwarnings("ignore", message=".*Attempting to use hipBLASLt.*")
 
 import torch
