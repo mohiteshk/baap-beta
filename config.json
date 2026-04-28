@@ -1,10 +1,6 @@
 {
     "paths": {
-        "video_folders": ["./my_drone_videos",
-                          "/mnt/extra/Drone/Beeta/15_harohalli_betta/",
-                          "/mnt/extra/Drone/Beeta/6_Alwar-Pushkar/",
-                          "/mnt/extra/Drone/Beeta/14_goa_march26/",
-                          "/mnt/extra/Drone/Bee/2_Alwar/"],
+        "video_folders": ["./my_drone_videos"],
                           
         "music_folders": ["./music"],
         "db_folder": "./chroma_db",
@@ -20,7 +16,8 @@
     "ai_settings": {
         "model_id": "openai/clip-vit-base-patch32",
         "collection_name": "drone_footage",
-        "search_top_k": 5
+        "search_top_k": 5,
+        "model_dir": "./models/"
     },
     "montage_timing": {
         "sync_to_beats": true,
