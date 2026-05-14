@@ -19,16 +19,18 @@
         "search_top_k": 5,
         "model_dir": "./models/"
     },
-    "montage_timing": {
+"montage_timing": {
         "sync_to_beats": true,
-        "clip_duration": 4.0,
+        "clip_duration_min": 2.5,
+        "clip_duration_max": 6.0,
         "fade_duration": 1.0,
-        "num_clips_to_generate": 20
+        "num_clips_to_generate": 12
     },
-    "intelligence_filters": {
+"intelligence_filters": {
         "fps_to_extract": 15,
+        "search_pool_size": 100,
+        "match_score_threshold": 0.75,
         "min_gap_seconds": 10.0,
-        "max_similarity_score": 0.65,
-        "max_motion_variance": 7.5
+        "max_similarity_score": 0.65
     }
 }
